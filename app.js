@@ -7,6 +7,11 @@
 
   // ---------------------------------------------------------------- 常量
   var STORAGE_KEY = 'codevault_data_v1';
+  var AUTH_KEY = 'codevault_auth_v1'; // 存 { hash: 密码哈希, until: 免登录到期时间 }
+  var SALT = 'codevault::';
+  // 默认密码 CodeVault2026 的哈希（明文不落盘；用户可在界面修改）
+  var DEFAULT_PWD_HASH = 'mhf4q9-1fnk903';
+  var REMEMBER_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
   var TYPE_LABELS = {
     template: '模板代码',
     problem: '题目代码',
@@ -44,6 +49,14 @@
   // ---------------------------------------------------------------- DOM
   var $ = function (id) { return document.getElementById(id); };
   var dom = {
+    authScreen: $('authScreen'),
+    authForm: $('authForm'),
+    authPassword: $('authPassword'),
+    authRemember: $('authRemember'),
+    authError: $('authError'),
+    passwordModal: $('passwordModal'),
+    passwordForm: $('passwordForm'),
+    passwordSubmit: $('passwordSubmit'),
     searchInput: $('searchInput'),
     sidebar: $('sidebar'),
     sidebarToggle: $('sidebarToggle'),
@@ -150,6 +163,59 @@
   }
 
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
+
+  // ---------------------------------------------------------------- 认证
+  function hashPassword(str) {
+    var s = SALT + String(str);
+    var h1 = 5381, h2 = 52711;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      h1 = ((h1 << 5) + h1 + c) >>> 0;
+      h2 = ((h2 << 5) + h2 + c) >>> 0;
+    }
+    return h1.toString(36) + '-' + h2.toString(36);
+  }
+
+  function getAuth() {
+    var raw = null;
+    try { raw = localStorage.getItem(AUTH_KEY); } catch (e) { return null; }
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }
+
+  function saveAuth(hash, remember) {
+    var payload = { hash: hash, until: remember ? Date.now() + REMEMBER_MS : 0 };
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify(payload)); } catch (e) {}
+  }
+
+  function currentHash() {
+    var auth = getAuth();
+    return auth && auth.hash ? auth.hash : DEFAULT_PWD_HASH;
+  }
+
+  // 是否已解锁：会话内解锁 或 免登录未过期
+  var sessionUnlocked = false;
+  function isUnlocked() {
+    if (sessionUnlocked) return true;
+    var auth = getAuth();
+    return !!(auth && auth.until && auth.until > Date.now());
+  }
+
+  function unlock(remember) {
+    sessionUnlocked = true;
+    saveAuth(currentHash(), remember);
+    dom.authScreen.hidden = true;
+    startApp();
+  }
+
+  function lockNow() {
+    sessionUnlocked = false;
+    var auth = getAuth();
+    if (auth) { auth.until = 0; try { localStorage.setItem(AUTH_KEY, JSON.stringify(auth)); } catch (e) {} }
+    dom.authScreen.hidden = false;
+    dom.authPassword.value = '';
+    setTimeout(function () { dom.authPassword.focus(); }, 50);
+  }
 
   function showToast(message, type) {
     dom.toast.textContent = message;
@@ -820,6 +886,54 @@
 
   // ---------------------------------------------------------------- 事件绑定
   function bindEvents() {
+    // 登录表单
+    dom.authForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var wrap = dom.authPassword.closest('.auth-input-wrap');
+      var pwd = dom.authPassword.value;
+      if (hashPassword(pwd) === currentHash()) {
+        unlock(dom.authRemember.checked);
+        dom.authError.hidden = true;
+        wrap.classList.remove('invalid');
+        showToast('欢迎回来', 'success');
+      } else {
+        dom.authError.hidden = false;
+        wrap.classList.remove('invalid');
+        void wrap.offsetWidth; // 触发重排以重播动画
+        wrap.classList.add('invalid');
+        dom.authPassword.select();
+      }
+    });
+    dom.authPassword.addEventListener('input', function () {
+      dom.authError.hidden = true;
+      dom.authPassword.closest('.auth-input-wrap').classList.remove('invalid');
+    });
+
+    // 修改密码表单
+    dom.passwordForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var form = dom.passwordForm;
+      var oldPwd = form.elements.oldpwd.value;
+      var newPwd = form.elements.newpwd.value;
+      var confirmPwd = form.elements.confirmpwd.value;
+      var ok = true;
+      $('oldPwdRow').classList.remove('invalid');
+      $('newPwdRow').classList.remove('invalid');
+      $('confirmPwdRow').classList.remove('invalid');
+
+      if (hashPassword(oldPwd) !== currentHash()) { $('oldPwdRow').classList.add('invalid'); ok = false; }
+      if (newPwd.length < 4) { $('newPwdRow').classList.add('invalid'); ok = false; }
+      if (newPwd !== confirmPwd || !newPwd) { $('confirmPwdRow').classList.add('invalid'); ok = false; }
+      if (!ok) return;
+
+      var newHash = hashPassword(newPwd);
+      saveAuth(newHash, true);
+      sessionUnlocked = true;
+      form.reset();
+      closeModal(dom.passwordModal);
+      showToast('访问密码已修改', 'success');
+    });
+
     // 导航分类
     document.addEventListener('click', function (e) {
       var nav = e.target.closest('.nav-item[data-category]');
@@ -999,8 +1113,9 @@
     document.addEventListener('keydown', function (e) {
       var tag = (e.target.tagName || '').toLowerCase();
       var typing = tag === 'input' || tag === 'textarea' || tag === 'select';
+      var locked = !isUnlocked(); // 未解锁时禁用全局快捷键
 
-      if (e.key === 'Escape') {
+      if (!locked && e.key === 'Escape') {
         var open = document.querySelectorAll('.modal:not([hidden])');
         if (open.length) closeModal(open[open.length - 1]);
         else {
@@ -1009,12 +1124,12 @@
         }
       }
 
-      if (!typing && e.key === '/' ) {
+      if (!locked && !typing && e.key === '/' ) {
         e.preventDefault();
         dom.searchInput.focus();
       }
 
-      if (typing && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      if (!locked && typing && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         if (!dom.editorModal.hidden) {
           e.preventDefault();
           dom.editorSubmit.click();
@@ -1029,6 +1144,12 @@
       case 'import': dom.importFile.click(); break;
       case 'clear': clearAll(); break;
       case 'sample': loadSampleData(); break;
+      case 'change-password':
+        dom.passwordForm.reset();
+        ['oldPwdRow', 'newPwdRow', 'confirmPwdRow'].forEach(function (id) { $(id).classList.remove('invalid'); });
+        openModal(dom.passwordModal);
+        break;
+      case 'lock': lockNow(); break;
     }
   }
 
@@ -1038,10 +1159,23 @@
   }
 
   // ---------------------------------------------------------------- 启动
-  function init() {
+  var appStarted = false;
+  function startApp() {
+    if (appStarted) return;
+    appStarted = true;
     state.data = loadData();
-    bindEvents();
     render();
+  }
+
+  function init() {
+    bindEvents();
+    if (isUnlocked()) {
+      dom.authScreen.hidden = true;
+      startApp();
+    } else {
+      dom.authScreen.hidden = false;
+      setTimeout(function () { dom.authPassword.focus(); }, 50);
+    }
   }
 
   if (document.readyState === 'loading') {
